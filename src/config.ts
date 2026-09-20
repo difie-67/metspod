@@ -57,7 +57,7 @@ export const config = {
   maxActiveDealsPerUser: Number(process.env.MAX_ACTIVE_DEALS_PER_USER || "10"),
 
   miniAppUrl: (process.env.MINI_APP_URL || "").trim().replace(/\/$/, ""),
-  miniAppPort: Number(process.env.MINI_APP_PORT || "3000"),
+  miniAppPort: Number(process.env.PORT || process.env.MINI_APP_PORT || "3000"),
   miniAppAuthMaxAgeSeconds: Number(process.env.MINI_APP_AUTH_MAX_AGE_SECONDS || "86400"),
   supportUsername: (process.env.SUPPORT_USERNAME || "admssupport_bot").trim().replace(/^@/, ""),
 
