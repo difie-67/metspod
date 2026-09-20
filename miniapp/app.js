@@ -1,0 +1,393 @@
+(() => {
+  "use strict";
+
+  const tg = window.Telegram?.WebApp;
+  const view = document.getElementById("view");
+  const toast = document.getElementById("toast");
+  const modal = document.getElementById("modal");
+  const walletPill = document.getElementById("wallet-pill");
+  let state = { user: null, config: null, deals: [], admin: null, route: "home", selectedDeal: null };
+  let tonConnectUI = null;
+  let backgroundSyncTimer = null;
+
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    tg.setHeaderColor("#ffffff");
+    tg.setBackgroundColor("#f5f9fe");
+    tg.enableClosingConfirmation();
+  }
+
+  const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
+  const short = (value, left = 6, right = 5) => value ? `${value.slice(0, left)}…${value.slice(-right)}` : "Не указан";
+  const formatDate = (seconds) => new Intl.DateTimeFormat("ru", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(seconds * 1000));
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: {
+        "content-type": "application/json",
+        "x-telegram-init-data": tg?.initData || "",
+        // ngrok's free development tunnel may otherwise return its HTML
+        // browser-warning page to fetch() instead of the JSON API response.
+        "ngrok-skip-browser-warning": "1",
+        ...(options.headers || {}),
+      },
+    });
+    const data = await response.json().catch(() => ({ error: "Сервер вернул некорректный ответ" }));
+    if (!response.ok || data.ok === false) throw new Error(data.error || `Ошибка ${response.status}`);
+    return data;
+  }
+
+  function showToast(message) {
+    toast.textContent = message;
+    toast.classList.add("show");
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => toast.classList.remove("show"), 2800);
+  }
+
+  function showModal(title, text, confirmText, onConfirm, danger = false) {
+    modal.hidden = false;
+    modal.innerHTML = `<div class="modal-card"><h2>${esc(title)}</h2><p>${esc(text)}</p><div class="button-row"><button id="modal-confirm" class="btn ${danger ? "btn-danger" : "btn-primary"}">${esc(confirmText)}</button><button id="modal-close" class="btn">Вернуться</button></div></div>`;
+    document.getElementById("modal-close").onclick = () => { modal.hidden = true; };
+    document.getElementById("modal-confirm").onclick = async (event) => {
+      event.currentTarget.disabled = true;
+      try { await onConfirm(); modal.hidden = true; } catch (error) { showToast(error.message); event.currentTarget.disabled = false; }
+    };
+  }
+
+  function setRoute(route) {
+    state.route = route;
+    document.querySelectorAll("[data-route]").forEach((item) => item.classList.toggle("active", item.dataset.route === route));
+    render();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function dealCard(deal) {
+    return `<button class="deal-card" data-deal="${deal.id}"><div class="deal-card-top"><h3>Сделка #${deal.id}</h3><span class="badge ${deal.status}">${esc(deal.statusLabel)}</span></div><p>${esc(deal.description)}</p><div class="deal-meta"><span class="amount">${esc(deal.amountTon)} TON</span><span>${deal.role === "buyer" ? "Покупатель" : deal.role === "seller" ? "Продавец" : "Админ"} · ${formatDate(deal.updatedAt)}</span></div></button>`;
+  }
+
+  function homeView() {
+    const active = state.deals.filter((deal) => !["completed", "cancelled", "resolved"].includes(deal.status));
+    const completed = state.deals.filter((deal) => ["completed", "resolved"].includes(deal.status));
+    return `<section class="hero"><p class="eyebrow">TON · SMART CONTRACT ESCROW</p><h1>Безопасные сделки в TON</h1><p>Деньги хранятся в отдельном смарт-контракте сделки и выпускаются только по её правилам.</p><div class="hero-actions"><button class="btn btn-primary" data-route="create">Создать сделку</button><button class="btn btn-secondary" data-route="deals">Мои сделки</button></div></section>
+      <div class="stats home-stats">
+        <article class="stat stat-primary"><div class="stat-top"><span class="stat-index">01</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${active.length}</strong><span class="stat-label">Активные<br>сделки</span><i class="stat-orbit"></i></article>
+        <article class="stat stat-solid"><div class="stat-top"><span class="stat-index">02</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${completed.length}</strong><span class="stat-label">Завершено<br>успешно</span><i class="stat-grid"></i></article>
+        <article class="stat stat-light"><div class="stat-top"><span class="stat-index">03</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${state.config.feePercent}%</strong><span class="stat-label">Фиксированная<br>комиссия</span><i class="stat-cross">＋</i></article>
+      </div>
+      <section class="journey-map"><div class="journey-head"><div><span>СЦЕНАРИЙ СДЕЛКИ</span><h2>От условий<br>до выплаты</h2></div><span class="journey-code">TON / 04</span></div><div class="journey-steps">
+        <article class="journey-step"><span class="journey-no">01</span><i>＋</i><strong>Создайте</strong><p>Укажите роль, сумму и условия.</p></article>
+        <article class="journey-step"><span class="journey-no">02</span><i>↗</i><strong>Пригласите</strong><p>Отправьте ссылку второй стороне.</p></article>
+        <article class="journey-step"><span class="journey-no">03</span><i>◎</i><strong>Оплатите</strong><p>TON поступят в отдельный контракт.</p></article>
+        <article class="journey-step"><span class="journey-no">04</span><i>✓</i><strong>Завершите</strong><p>Подтвердите получение и выплату.</p></article>
+      </div></section>
+      <div class="section-head"><h2>Активные сделки</h2><button class="text-button" data-route="deals">Показать все</button></div>
+      <div class="card-list">${active.length ? active.slice(0, 3).map(dealCard).join("") : `<div class="empty">Активных сделок пока нет.<br><br><button class="btn btn-primary" data-route="create">Создать первую</button></div>`}</div>
+      <div class="section-head"><h2>Почему это прозрачно</h2></div>
+      <div class="trust-grid"><div class="trust-card"><strong>Отдельный контракт</strong><p>Каждая сделка получает собственный on-chain адрес.</p></div><div class="trust-card"><strong>Фиксированные стороны</strong><p>Адреса покупателя, продавца и комиссии записаны при создании.</p></div><div class="trust-card"><strong>Проверяемо</strong><p>Баланс и операции доступны в Tonviewer и Tonscan.</p></div><div class="trust-card"><strong>Арбитраж</strong><p>После оплаты спор решается только в пользу заданных участников.</p></div></div>`;
+  }
+
+  function dealsView() {
+    return `<h1 class="page-title">Мои сделки</h1><p class="page-intro">Все созданные и принятые вами сделки. Статус контракта обновится при открытии карточки.</p><div class="card-list deal-grid">${state.deals.length ? state.deals.map(dealCard).join("") : `<div class="empty">Список пуст</div>`}</div>`;
+  }
+
+  function createView() {
+    return `<h1 class="page-title">Новая сделка</h1><p class="page-intro">Укажите условия. После создания отправьте одноразовую ссылку второй стороне.</p><form id="create-form" class="panel panel-blueprint">
+      <div class="field"><label>Ваша роль</label><div class="segmented"><label><input type="radio" name="role" value="buyer" checked><span>Я покупатель</span></label><label><input type="radio" name="role" value="seller"><span>Я продавец</span></label></div></div>
+      <div class="field"><label for="counterparty">Username второй стороны</label><input id="counterparty" name="counterparty" placeholder="@username (необязательно)" autocomplete="off"></div>
+      <div class="field"><label for="amount">Сумма в TON</label><input id="amount" name="amount" inputmode="decimal" placeholder="0,01" required></div><p class="hint">Лимит: ${esc(state.config.minDealTon)}–${esc(state.config.maxDealTon)} TON. Комиссия ${state.config.feePercent}% удерживается при выплате.</p>
+      <div class="field"><label for="description">Товар, услуга и условия передачи</label><textarea id="description" name="description" maxlength="1000" placeholder="Опишите предмет сделки так, чтобы обеим сторонам были понятны условия" required></textarea></div>
+      <button class="btn btn-primary btn-block" type="submit">Создать и получить приглашение</button></form>`;
+  }
+
+  function profileView() {
+    return `<h1 class="page-title">Профиль</h1><p class="page-intro">TON-адрес используется как адрес покупателя или получателя выплаты. Seed-фраза боту не нужна.</p><form id="wallet-form" class="panel panel-blueprint"><h2>Кошелёк</h2><div class="field"><label for="wallet-address">Ваш TON-адрес</label><input id="wallet-address" name="address" value="${esc(state.user.walletAddress || "")}" placeholder="EQ… или UQ…" required></div><button class="btn btn-primary btn-block">Сохранить адрес</button></form>
+      <div class="panel panel-orbit"><h3>Аккаунт Telegram</h3><dl class="kv"><dt>Имя</dt><dd>${esc([state.user.first_name, state.user.last_name].filter(Boolean).join(" "))}</dd><dt>Username</dt><dd>${state.user.username ? "@" + esc(state.user.username) : "не задан"}</dd><dt>Telegram ID</dt><dd>${state.user.id}</dd><dt>Доступ</dt><dd><span class="access-badge ${state.user.isAdmin ? "admin" : "user"}">${state.user.isAdmin ? "Администратор" : "Пользователь"}</span></dd><dt>Сеть</dt><dd>${esc(state.config.network)}</dd></dl>${state.user.isAdmin ? `<button class="btn btn-primary btn-block" data-route="admin">Открыть админ-панель</button>` : `<p class="hint admin-hint">Если здесь должен быть статус администратора, сравните Telegram ID выше со значением ARBITER_TG_IDS в Railway.</p>`}</div>
+      <div class="panel panel-lines"><h3>Помощь</h3><p class="page-intro">Не сообщайте никому seed-фразу. При проблеме со сделкой после оплаты откройте спор.</p><a class="btn btn-block" href="https://t.me/${encodeURIComponent(state.config.supportUsername)}">Написать @${esc(state.config.supportUsername)}</a></div>`;
+  }
+
+  function transparencyView() {
+    return `<h1 class="page-title">On-chain прозрачность</h1><p class="page-intro">Данные можно самостоятельно проверить в блокчейне TON.</p><div id="transparency-data" class="panel panel-blueprint"><div class="loading-screen" style="min-height:220px"><div class="loader"></div><p>Читаем блокчейн…</p></div></div>
+      <div class="trust-grid"><div class="trust-card"><strong>Депозит не на кошельке бота</strong><p>Средства находятся на отдельном escrow-контракте.</p></div><div class="trust-card"><strong>Получатели неизменяемы</strong><p>Контракт не позволяет арбитру подставить произвольный адрес.</p></div></div>
+      <div class="panel panel-lines" id="terms"><h3>Важно</h3><p class="page-intro">Текущая версия — mainnet MVP без независимого аудита. Начинайте с небольших сумм и проверяйте адрес перед переводом.</p></div><div class="panel panel-orbit" id="privacy"><h3>Конфиденциальность</h3><p class="page-intro">Сервис использует Telegram ID, username, указанный TON-адрес и данные сделки. Seed-фразы не запрашиваются и не сохраняются.</p></div>`;
+  }
+
+  function adminView() {
+    if (!state.user.isAdmin) return `<div class="error-box">Нет доступа</div>`;
+    const stats = state.admin.stats;
+    return `<h1 class="page-title">Админ-панель</h1><p class="page-intro">Контроль активных сделок и споров. Blockchain-действия необратимы.</p><div class="stats home-stats admin-stats"><article class="stat stat-primary"><div class="stat-top"><span class="stat-index">01</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${stats.users}</strong><span class="stat-label">Пользова-<br>телей</span><i class="stat-orbit"></i></article><article class="stat stat-solid"><div class="stat-top"><span class="stat-index">02</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${stats.active}</strong><span class="stat-label">Активных<br>сделок</span><i class="stat-grid"></i></article><article class="stat stat-light"><div class="stat-top"><span class="stat-index">03</span><span class="stat-signal"><b></b><b></b><b></b></span></div><strong>${stats.disputed}</strong><span class="stat-label">Открытых<br>споров</span><i class="stat-cross">＋</i></article></div><div class="section-head"><h2>Последние сделки</h2></div><div class="card-list">${state.admin.recent.map(dealCard).join("") || `<div class="empty">Сделок нет</div>`}</div>`;
+  }
+
+  const stages = [
+    ["draft", "Участники присоединяются"], ["awaiting_wallets", "Адреса кошельков"], ["deployed", "Оплата в escrow"], ["funded", "Передача и подтверждение"], ["completed", "Выплата продавцу"],
+  ];
+
+  function nextStepForDeal(deal) {
+    if (deal.role === "admin") {
+      if (deal.status === "disputed") return { tone: "warning", label: "ТРЕБУЕТСЯ РЕШЕНИЕ", title: "Рассмотрите открытый спор", text: "Проверьте доказательства обеих сторон и выберите возврат либо распределение средств." };
+      return { tone: "calm", label: "РЕЖИМ АРБИТРА", title: "Следите за состоянием сделки", text: "Действия арбитра появятся ниже, когда они будут допустимы контрактом." };
+    }
+    if (!state.user.walletAddress && ["draft", "awaiting_wallets"].includes(deal.status)) {
+      return { tone: "attention", label: "ШАГ 01 · КОШЕЛЁК", title: "Сохраните свой TON-адрес", text: "Без адресов покупателя и продавца escrow-контракт не будет создан.", action: `<button class="btn btn-primary btn-block" data-route="profile">Добавить кошелёк</button>` };
+    }
+    if (deal.status === "draft") {
+      return { tone: "attention", label: "ШАГ 02 · УЧАСТНИК", title: "Пригласите вторую сторону", text: "Отправьте одноразовую ссылку покупателю или продавцу. После присоединения бот продолжит сделку автоматически.", action: deal.inviteToken ? `<button class="btn btn-primary btn-block" data-action="share">Поделиться приглашением</button>` : "" };
+    }
+    if (deal.status === "awaiting_wallets") {
+      return { tone: "calm", label: "ШАГ 02 · АДРЕСА", title: "Ожидаем кошелёк второй стороны", text: "Ваш адрес сохранён. Контракт развернётся автоматически, когда второй участник укажет свой TON-адрес." };
+    }
+    if (deal.status === "setup_pending") {
+      return { tone: "progress", label: "ШАГ 03 · BLOCKCHAIN", title: "Создаём escrow-контракт", text: "Не переводите TON до появления адреса и кнопки оплаты. Обычно подтверждение занимает меньше минуты." };
+    }
+    if (deal.status === "deployed" && deal.role === "buyer") {
+      return { tone: "attention", label: "ШАГ 03 · ОПЛАТА", title: `Внесите ${deal.amountTon} TON в escrow`, text: "Используйте кнопку ниже: сумма и адрес контракта будут подставлены автоматически.", action: `<button class="btn btn-primary btn-block" data-action="pay">Оплатить ${esc(deal.amountTon)} TON</button>` };
+    }
+    if (deal.status === "deployed") {
+      return { tone: "calm", label: "ШАГ 03 · ОЖИДАНИЕ", title: "Покупатель ещё не оплатил", text: "Не передавайте товар или услугу, пока статус не изменится на «Оплачено»." };
+    }
+    if (deal.status === "funded" && deal.role === "buyer") {
+      return { tone: "success", label: "ШАГ 04 · ПОЛУЧЕНИЕ", title: "Оплата защищена контрактом", text: "Проверьте товар или услугу. Подтверждайте получение только когда всё выполнено; при проблеме откройте спор.", action: `<div class="button-row"><button class="btn btn-primary btn-block" data-action="confirm">Подтвердить получение</button><button class="btn btn-danger btn-block" data-action="dispute">Открыть спор</button></div>` };
+    }
+    if (deal.status === "funded") {
+      return { tone: "success", label: "ШАГ 04 · ИСПОЛНЕНИЕ", title: "Оплата получена escrow-контрактом", text: "Теперь передайте покупателю товар или окажите услугу. Выплата поступит после его подтверждения." };
+    }
+    if (deal.status === "disputed") {
+      return { tone: "warning", label: "СПОР ОТКРЫТ", title: "Выплата приостановлена", text: "Свяжитесь с поддержкой и предоставьте доказательства. Средства останутся в escrow до решения арбитра.", action: `<a class="btn btn-block" href="https://t.me/${encodeURIComponent(state.config.supportUsername)}">Написать в поддержку</a>` };
+    }
+    if (["confirm_pending", "cancel_pending", "resolve_pending"].includes(deal.status)) {
+      return { tone: "progress", label: "ТРАНЗАКЦИЯ ОТПРАВЛЕНА", title: "Ожидаем подтверждение TON", text: "Ничего дополнительно делать не нужно. Карточка обновится автоматически после включения транзакции в блок." };
+    }
+    if (deal.status === "completed") return { tone: "success", label: "СДЕЛКА ЗАВЕРШЕНА", title: "Выплата отправлена продавцу", text: "Escrow-контракт завершил сделку. Операцию можно проверить в блокчейн-обозревателе ниже." };
+    if (deal.status === "cancelled") return { tone: "calm", label: "СДЕЛКА ОТМЕНЕНА", title: "Сделка закрыта", text: "Если оплата успела поступить в контракт, возврат отправлен покупателю." };
+    if (deal.status === "resolved") return { tone: "success", label: "СПОР РАЗРЕШЁН", title: "Средства распределены", text: "Решение арбитра отправлено в блокчейн и сделка закрыта." };
+    return { tone: "calm", label: "ТЕКУЩИЙ СТАТУС", title: deal.statusLabel, text: "Карточка будет обновляться автоматически." };
+  }
+
+  function dealView(deal) {
+    const statusOrder = { draft: 0, awaiting_wallets: 1, setup_pending: 2, deployed: 2, funded: 3, disputed: 3, confirm_pending: 4, completed: 5, cancel_pending: 4, cancelled: 5, resolve_pending: 4, resolved: 5 };
+    const level = statusOrder[deal.status] ?? 0;
+    const canPay = deal.role === "buyer" && deal.status === "deployed" && deal.contractAddress;
+    const canConfirm = deal.role === "buyer" && deal.status === "funded";
+    const canDispute = ["buyer", "seller"].includes(deal.role) && deal.status === "funded";
+    const canCancel = ["draft", "awaiting_wallets", "deployed"].includes(deal.status) && ["buyer", "seller"].includes(deal.role);
+    const actions = [
+      canPay ? `<button class="btn btn-primary btn-block" data-action="pay">Оплатить ${esc(deal.amountTon)} TON</button>` : "",
+      canConfirm ? `<button class="btn btn-primary btn-block" data-action="confirm">Подтвердить получение</button>` : "",
+      canDispute ? `<button class="btn btn-danger btn-block" data-action="dispute">Открыть спор</button>` : "",
+      canCancel ? `<button class="btn btn-danger btn-block" data-action="cancel">Отменить сделку</button>` : "",
+    ].join("");
+    const adminActions = state.user.isAdmin && ["deployed", "funded", "disputed"].includes(deal.status) ? `<div class="panel"><h3>Действия арбитра</h3><div class="button-row"><button class="btn btn-danger" data-action="admin_cancel">Возврат покупателю</button>${["funded", "disputed"].includes(deal.status) ? `<button class="btn" data-action="admin_resolve">Распределить средства</button>` : ""}</div></div>` : "";
+    const nextStep = nextStepForDeal(deal);
+    return `<button class="text-button" data-route="deals">← Все сделки</button><section class="detail-head"><span class="badge ${deal.status}">${esc(deal.statusLabel)}</span><h1>${esc(deal.amountTon)} TON</h1><p>Сделка #${deal.id} · ${deal.role === "buyer" ? "вы покупатель" : deal.role === "seller" ? "вы продавец" : "режим администратора"}</p></section>
+      <section class="next-step ${nextStep.tone}"><div class="next-step-top"><span class="live-dot"></span><span>${esc(nextStep.label)}</span><small>обновляется автоматически</small></div><h2>${esc(nextStep.title)}</h2><p>${esc(nextStep.text)}</p>${nextStep.action || ""}</section>
+      <div class="panel"><h3>Условия</h3><p>${esc(deal.description)}</p><dl class="kv"><dt>Покупатель</dt><dd>${deal.buyer?.username ? "@" + esc(deal.buyer.username) : deal.buyer ? `ID ${deal.buyer.id}` : "ожидается"}</dd><dt>Продавец</dt><dd>${deal.seller?.username ? "@" + esc(deal.seller.username) : deal.seller ? `ID ${deal.seller.id}` : "ожидается"}</dd><dt>Создана</dt><dd>${formatDate(deal.createdAt)}</dd></dl></div>
+      ${deal.contractAddress ? `<div class="panel"><h3>Escrow-контракт</h3><button class="copy-value" data-copy="${esc(deal.contractAddress)}">${esc(deal.contractAddress)}</button><div class="link-list" style="margin-top:10px"><a href="${esc(deal.explorers.tonviewer)}">Открыть в Tonviewer ↗</a><a href="${esc(deal.explorers.tonscan)}">Открыть в Tonscan ↗</a></div></div>` : ""}
+      ${deal.inviteToken ? `<div class="panel"><h3>Приглашение</h3><p class="page-intro">Отправьте ссылку второй стороне. Она одноразовая.</p><button class="btn btn-primary btn-block" data-action="share">Поделиться приглашением</button></div>` : ""}
+      <div class="panel"><h3>Ход сделки</h3><ol class="timeline">${stages.map((stage, index) => `<li class="${level >= index ? "done" : ""}">${stage[1]}</li>`).join("")}</ol></div>
+      ${actions ? `<div class="panel"><h3>Доступные действия</h3><div class="button-row">${actions}</div></div>` : ""}${adminActions}`;
+  }
+
+  function render() {
+    if (!state.user) return;
+    document.querySelectorAll("#tabbar [data-route]").forEach((item) => item.classList.toggle("active", item.dataset.route === state.route));
+    walletPill.textContent = state.user.walletAddress ? short(state.user.walletAddress) : "Добавить кошелёк";
+    if (state.route === "home") view.innerHTML = homeView();
+    else if (state.route === "deals") view.innerHTML = dealsView();
+    else if (state.route === "create") view.innerHTML = createView();
+    else if (state.route === "profile") view.innerHTML = profileView();
+    else if (state.route === "transparency") { view.innerHTML = transparencyView(); loadTransparency(); }
+    else if (state.route === "admin") view.innerHTML = adminView();
+    else if (state.route === "deal" && state.selectedDeal) view.innerHTML = dealView(state.selectedDeal);
+    bindCurrentView();
+  }
+
+  function bindCurrentView() {
+    view.querySelectorAll("[data-route]").forEach((item) => item.onclick = () => setRoute(item.dataset.route));
+    view.querySelectorAll("[data-deal]").forEach((item) => item.onclick = () => openDeal(Number(item.dataset.deal)));
+    view.querySelectorAll("[data-copy]").forEach((item) => item.onclick = async () => { await navigator.clipboard.writeText(item.dataset.copy); showToast("Адрес скопирован"); });
+    document.getElementById("create-form")?.addEventListener("submit", createDeal);
+    document.getElementById("wallet-form")?.addEventListener("submit", saveWallet);
+    view.querySelectorAll("[data-action]").forEach((item) => item.onclick = () => dealAction(item.dataset.action));
+  }
+
+  async function refresh() {
+    const data = await api("/api/bootstrap");
+    state = { ...state, ...data };
+    render();
+  }
+
+  async function backgroundRefresh() {
+    if (!state.user || document.hidden) return;
+    try {
+      const previousStatus = state.selectedDeal?.status;
+      const selectedId = state.selectedDeal?.id;
+      const data = await api("/api/bootstrap");
+      state = { ...state, ...data };
+      if (selectedId) {
+        const fresh = data.deals.find((deal) => deal.id === selectedId);
+        if (fresh) state.selectedDeal = { ...state.selectedDeal, ...fresh };
+      }
+      if (state.route !== "transparency") render();
+      if (previousStatus && state.selectedDeal?.status !== previousStatus) {
+        showToast(`Статус обновлён: ${state.selectedDeal.statusLabel}`);
+        tg?.HapticFeedback?.notificationOccurred("success");
+      }
+    } catch (error) {
+      console.warn("Background refresh failed", error);
+    }
+  }
+
+  function startBackgroundSync() {
+    clearInterval(backgroundSyncTimer);
+    backgroundSyncTimer = setInterval(() => void backgroundRefresh(), 15_000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) void backgroundRefresh();
+    });
+  }
+
+  async function openDeal(id) {
+    view.innerHTML = `<section class="loading-screen"><div class="loader"></div><p>Проверяем контракт…</p></section>`;
+    try {
+      const data = await api(`/api/deals/${id}`);
+      state.selectedDeal = data.deal;
+      state.route = "deal";
+      render();
+    } catch (error) { showToast(error.message); setRoute("deals"); }
+  }
+
+  async function createDeal(event) {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector("button[type=submit]");
+    button.disabled = true;
+    const form = new FormData(event.currentTarget);
+    try {
+      const data = await api("/api/deals", { method: "POST", body: JSON.stringify({ role: form.get("role"), counterpartyUsername: form.get("counterparty"), amountTon: String(form.get("amount")).replace(",", "."), description: form.get("description") }) });
+      await refresh();
+      state.selectedDeal = { ...data.deal, inviteUrl: data.inviteUrl };
+      state.route = "deal";
+      render();
+      showInvite(data.inviteUrl);
+    } catch (error) { showToast(error.message); button.disabled = false; }
+  }
+
+  function showInvite(inviteUrl) {
+    showModal("Сделка создана", "Отправьте одноразовую ссылку второй стороне. После присоединения оба участника должны сохранить TON-адреса.", "Поделиться", async () => {
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(inviteUrl)}&text=${encodeURIComponent("Приглашение в безопасную сделку OBRA GUARANT")}`;
+      if (tg?.openTelegramLink) tg.openTelegramLink(shareUrl); else window.open(shareUrl, "_blank");
+    });
+  }
+
+  async function saveWallet(event) {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector("button");
+    button.disabled = true;
+    try {
+      const address = new FormData(event.currentTarget).get("address");
+      const data = await api("/api/wallet", { method: "POST", body: JSON.stringify({ address }) });
+      state.user.walletAddress = data.walletAddress;
+      walletPill.textContent = short(data.walletAddress);
+      showToast("Кошелёк сохранён");
+      await refresh();
+    } catch (error) { showToast(error.message); button.disabled = false; }
+  }
+
+  async function tonConnect() {
+    if (!window.TON_CONNECT_UI?.TonConnectUI) throw new Error("TON Connect не загрузился. Проверьте интернет и повторите.");
+    if (!tonConnectUI) {
+      tonConnectUI = new window.TON_CONNECT_UI.TonConnectUI({ manifestUrl: `${location.origin}/tonconnect-manifest.json` });
+    }
+    if (!tonConnectUI.connected) {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => { unsubscribe(); reject(new Error("Подключение кошелька не завершено")); }, 120_000);
+        const unsubscribe = tonConnectUI.onStatusChange((wallet) => {
+          if (!wallet) return;
+          clearTimeout(timeout);
+          unsubscribe();
+          resolve();
+        }, (error) => {
+          clearTimeout(timeout);
+          unsubscribe();
+          reject(error);
+        });
+        tonConnectUI.openModal().catch((error) => {
+          clearTimeout(timeout);
+          unsubscribe();
+          reject(error);
+        });
+      });
+    }
+    return tonConnectUI;
+  }
+
+  async function payDeal() {
+    const deal = state.selectedDeal;
+    const connector = await tonConnect();
+    const account = connector.account;
+    if (!account) throw new Error("Подключите TON-кошелёк");
+    if (deal.buyerAddressRaw && account.address.toLowerCase() !== deal.buyerAddressRaw.toLowerCase()) throw new Error("Подключён не тот кошелёк, который указан покупателем в сделке");
+    await connector.sendTransaction({ validUntil: Math.floor(Date.now() / 1000) + 600, messages: [{ address: deal.contractAddressRaw || deal.contractAddress, amount: deal.amountUnits }] });
+    showToast("Транзакция отправлена. Ожидаем подтверждение сети.");
+  }
+
+  async function postAction(action, extra = {}) {
+    const data = await api(`/api/deals/${state.selectedDeal.id}/action`, { method: "POST", body: JSON.stringify({ action, ...extra }) });
+    state.selectedDeal = data.deal;
+    await refresh();
+    await openDeal(data.deal.id);
+  }
+
+  function dealAction(action) {
+    const deal = state.selectedDeal;
+    if (action === "pay") return payDeal().catch((error) => showToast(error.message));
+    if (action === "share") {
+      const url = deal.inviteUrl || `https://t.me/${state.config.botUsername}?start=join_${deal.inviteToken}`;
+      return showInvite(url);
+    }
+    if (action === "confirm") return showModal("Подтвердить получение?", "После подтверждения контракт необратимо отправит 98% продавцу и 2% платформе.", "Да, всё получено", () => postAction("confirm"));
+    if (action === "dispute") return showModal("Открыть спор?", "Выплата будет остановлена до решения арбитра. Свяжитесь с поддержкой и предоставьте доказательства.", "Открыть спор", () => postAction("dispute"), true);
+    if (action === "cancel") return showModal("Отменить сделку?", "До оплаты отмена окончательная. Если транзакция уже отправлена, сначала будет проверен контракт.", "Отменить сделку", () => postAction("cancel"), true);
+    if (action === "admin_cancel") return showModal("Вернуть покупателю?", "Blockchain-действие необратимо.", "Отправить возврат", () => postAction("admin_cancel"), true);
+    if (action === "admin_resolve") {
+      modal.hidden = false;
+      modal.innerHTML = `<div class="modal-card"><h2>Решить спор</h2><p>Укажите целый процент остатка продавцу. Остальное получит покупатель; комиссия платформы удерживается контрактом.</p><div class="field"><label>Процент продавцу</label><input id="seller-percent" type="number" min="0" max="100" value="50"></div><div class="button-row"><button id="modal-confirm" class="btn btn-primary">Продолжить</button><button id="modal-close" class="btn">Вернуться</button></div></div>`;
+      document.getElementById("modal-close").onclick = () => modal.hidden = true;
+      document.getElementById("modal-confirm").onclick = async (event) => { event.currentTarget.disabled = true; try { await postAction("admin_resolve", { sellerPercent: Number(document.getElementById("seller-percent").value) }); modal.hidden = true; } catch (error) { showToast(error.message); event.currentTarget.disabled = false; } };
+    }
+  }
+
+  async function loadTransparency() {
+    try {
+      const data = await api("/api/transparency");
+      const target = document.getElementById("transparency-data");
+      if (!target) return;
+      target.innerHTML = `<h3>Параметры сервиса</h3><dl class="kv"><dt>Сеть</dt><dd>${esc(data.network)}</dd><dt>Комиссия</dt><dd>${data.feePercent}%</dd><dt>Баланс газа</dt><dd>${esc(data.serviceBalanceTon)} TON (${esc(data.serviceState)})</dd><dt>Service wallet</dt><dd><button class="copy-value" data-copy="${esc(data.serviceAddress)}">${esc(data.serviceAddress)}</button></dd><dt>Комиссия</dt><dd><button class="copy-value" data-copy="${esc(data.platformAddress)}">${esc(data.platformAddress)}</button></dd><dt>Hash кода</dt><dd><span class="copy-value">${esc(data.codeHash)}</span></dd></dl><div class="link-list" style="margin-top:14px"><a href="${esc(data.explorers.tonviewer)}">Service wallet в Tonviewer ↗</a><a href="${esc(data.explorers.tonscan)}">Service wallet в Tonscan ↗</a></div>`;
+      bindCurrentView();
+    } catch (error) { const target = document.getElementById("transparency-data"); if (target) target.innerHTML = `<div class="error-box">${esc(error.message)}</div>`; }
+  }
+
+  async function handleStartParam() {
+    const param = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get("tgWebAppStartParam");
+    if (!param?.startsWith("join_")) return;
+    try {
+      const data = await api("/api/join", { method: "POST", body: JSON.stringify({ token: param.slice(5) }) });
+      await refresh();
+      await openDeal(data.deal.id);
+      showToast("Вы присоединились к сделке");
+    } catch (error) { showToast(error.message); }
+  }
+
+  document.querySelectorAll("[data-route]").forEach((item) => item.addEventListener("click", () => setRoute(item.dataset.route)));
+
+  (async () => {
+    try {
+      if (!tg?.initData) throw new Error("Для защищённой авторизации откройте Mini App кнопкой внутри Telegram-бота.");
+      await refresh();
+      startBackgroundSync();
+      await handleStartParam();
+    } catch (error) {
+      view.innerHTML = `<div class="error-box"><b>Mini App не удалось открыть</b><br><br>${esc(error.message)}</div><div class="panel"><h3>Локальный просмотр</h3><p class="page-intro">Страница загружена, но операции и данные доступны только после проверки Telegram initData.</p></div>`;
+      document.getElementById("tabbar").hidden = true;
+    }
+  })();
+})();
