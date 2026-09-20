@@ -88,7 +88,7 @@ export function setWalletAddress(tgId: number, address: string) {
 }
 
 export function getUser(tgId: number): UserRow | undefined {
-  return db.prepare(`SELECT * FROM users WHERE tg_id = ?`).get(tgId) as UserRow | undefined;
+  return db.prepare(`SELECT * FROM users WHERE tg_id = ?`).get(tgId) as unknown as UserRow | undefined;
 }
 
 export function createDeal(params: {
@@ -124,11 +124,11 @@ export function createDeal(params: {
 }
 
 export function getDeal(dealId: number): DealRow | undefined {
-  return db.prepare(`SELECT * FROM deals WHERE deal_id = ?`).get(dealId) as DealRow | undefined;
+  return db.prepare(`SELECT * FROM deals WHERE deal_id = ?`).get(dealId) as unknown as DealRow | undefined;
 }
 
 export function getDealByInviteToken(token: string): DealRow | undefined {
-  return db.prepare(`SELECT * FROM deals WHERE invite_token = ?`).get(token) as DealRow | undefined;
+  return db.prepare(`SELECT * FROM deals WHERE invite_token = ?`).get(token) as unknown as DealRow | undefined;
 }
 
 export function joinDeal(dealId: number, tgId: number, username: string | undefined | null): DealRow {
