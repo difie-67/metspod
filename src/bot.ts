@@ -1,0 +1,837 @@
+import { Bot, Context, InlineKeyboard, Keyboard } from "grammy";
+import { config, dealLimits } from "./config";
+import {
+  cancelDraftDeal,
+  claimDealSetup,
+  countActiveDealsForUser,
+  createDeal,
+  DealRow,
+  DealStatus,
+  getDeal,
+  getDealByInviteToken,
+  getDealsByStatuses,
+  getDealsForWatcher,
+  getDealsForUser,
+  getAdminStats,
+  getPendingDealsForUser,
+  getRecentDeals,
+  getUser,
+  isDealParticipant,
+  joinDeal,
+  setDealAddresses,
+  setDealContractAddress,
+  setDealStatus,
+  setWalletAddress,
+  upsertUser,
+} from "./db";
+import { formatTonAmount, parseTonAmount } from "./amounts";
+import { emoji } from "./emoji";
+import {
+  computeEscrowAddress,
+  deployEscrow,
+  formatAddress,
+  getArbiterWallet,
+  getDealOnChainState,
+  getEscrowCodeHash,
+  getServiceWalletInfo,
+  parseAddress,
+  sendCancel,
+  sendConfirm,
+  sendResolve,
+} from "./ton";
+
+export const bot = new Bot(config.botToken);
+
+const BTN_NEW = "Новая сделка";
+const BTN_DEALS = "Мои сделки";
+const BTN_WALLET = "Кошелёк";
+const BTN_HELP = "Помощь";
+const BTN_VERIFY = "Проверить прозрачность";
+const BTN_ADMIN = "Админ-панель";
+const BTN_STOP = "Закрыть ввод";
+
+export function mainMenu(admin = false): Keyboard {
+  const keyboard = new Keyboard()
+    .text(BTN_NEW).icon(emoji.newDeal).text(BTN_DEALS).icon(emoji.myDeals).row()
+    .text(BTN_WALLET).icon(emoji.wallet).text(BTN_HELP).icon(emoji.help).row()
+    .text(BTN_VERIFY).icon(emoji.transparency);
+  if (config.miniAppUrl) keyboard.row().webApp("Открыть Mini App", config.miniAppUrl);
+  if (admin) keyboard.row().text(BTN_ADMIN).icon(emoji.safety);
+  return keyboard.resized().persistent();
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function monospace(value: string): string {
+  return `<code>${escapeHtml(value)}</code>`;
+}
+
+function isArbiter(tgId: number): boolean {
+  return config.arbiterTgIds.includes(tgId);
+}
+
+function formatDealAmount(deal: DealRow): string {
+  return `${formatTonAmount(deal.amount_units)} TON`;
+}
+
+function dealFeeUnits(deal: DealRow): bigint {
+  return (BigInt(deal.amount_units) * BigInt(config.feeBps)) / 10000n;
+}
+
+function dealPaymentUnits(deal: DealRow): bigint {
+  return BigInt(deal.amount_units) + (deal.fee_payer === "buyer" ? dealFeeUnits(deal) : 0n);
+}
+
+function formatDealPayment(deal: DealRow): string {
+  return `${formatTonAmount(dealPaymentUnits(deal))} TON`;
+}
+
+function tonviewerUrl(address: string): string {
+  const host = config.tonNetwork === "testnet" ? "https://testnet.tonviewer.com" : "https://tonviewer.com";
+  return `${host}/${encodeURIComponent(address)}`;
+}
+
+function tonscanUrl(address: string): string {
+  const host = config.tonNetwork === "testnet" ? "https://testnet.tonscan.org" : "https://tonscan.org";
+  return `${host}/address/${encodeURIComponent(address)}`;
+}
+
+/**
+ * Standard TON transfer URI. `amount` is in nanotons, so it is exactly the
+ * value locked by the contract, not a rounded decimal value. Do not add a
+ * `text`/comment parameter: the escrow accepts a plain TON transfer only.
+ */
+function tonPaymentUrl(deal: DealRow): string | null {
+  if (!deal.contract_address) return null;
+  return `ton://transfer/${encodeURIComponent(deal.contract_address)}?amount=${encodeURIComponent(dealPaymentUnits(deal).toString())}`;
+}
+
+/** MyTonWallet's documented HTTPS invoice format for a direct TON transfer. */
+function myTonWalletPaymentUrl(deal: DealRow): string | null {
+  if (!deal.contract_address || config.tonNetwork !== "mainnet") return null;
+  return `https://my.tt/transfer/${encodeURIComponent(deal.contract_address)}?amount=${encodeURIComponent(dealPaymentUnits(deal).toString())}`;
+}
+
+function addPaymentButtons(keyboard: InlineKeyboard, deal: DealRow): InlineKeyboard {
+  const tonUrl = tonPaymentUrl(deal);
+  const myTonWalletUrl = myTonWalletPaymentUrl(deal);
+  if (tonUrl) keyboard.url("Tonkeeper", tonUrl).icon(emoji.payment).row();
+  if (myTonWalletUrl) keyboard.url("MyTonWallet", myTonWalletUrl).icon(emoji.payment).row();
+  return keyboard;
+}
+
+function paymentKeyboard(deal: DealRow): InlineKeyboard {
+  return addPaymentButtons(new InlineKeyboard(), deal);
+}
+
+function statusLabel(status: DealRow["status"]): string {
+  const labels: Record<DealRow["status"], string> = {
+    draft: "ожидает второго участника",
+    awaiting_wallets: "ожидает адреса кошельков",
+    setup_pending: "контракт разворачивается",
+    deployed: "ожидает оплату покупателя",
+    funded: "оплачена, ожидает подтверждение покупателя",
+    disputed: "открыт спор",
+    confirm_pending: "выплата отправлена в блокчейн",
+    cancel_pending: "возврат отправлен в блокчейн",
+    resolve_pending: "решение спора отправлено в блокчейн",
+    completed: "завершена",
+    cancelled: "отменена",
+    resolved: "спор разрешён",
+  };
+  return labels[status];
+}
+
+function dealSummary(deal: DealRow): string {
+  return [
+    `Сделка #${deal.deal_id}`,
+    `Статус: ${statusLabel(deal.status)}`,
+    `Сумма: ${formatDealAmount(deal)}`,
+    `Комиссию оплачивает: ${deal.fee_payer === "buyer" ? "покупатель" : "продавец"}`,
+    `Предмет сделки: ${escapeHtml(deal.description)}`,
+    deal.contract_address ? `Escrow-адрес: ${monospace(deal.contract_address)}` : null,
+    deal.contract_address ? `Проверить on-chain: ${tonviewerUrl(deal.contract_address)}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+type WizardStep = "wallet" | "role" | "counterparty" | "amount" | "fee_payer" | "description";
+interface WizardState {
+  step: WizardStep;
+  role?: "buyer" | "seller";
+  counterpartyUsername?: string | null;
+  amountUnits?: bigint;
+  feePayer?: "buyer" | "seller";
+}
+
+const wizards = new Map<number, WizardState>();
+const newDealCooldowns = new Map<number, number>();
+let botUsernameCache: string | null = null;
+
+export function setBotUsername(username: string) {
+  botUsernameCache = username;
+}
+
+export async function botUsername(): Promise<string> {
+  if (botUsernameCache) return botUsernameCache;
+  const username = (await bot.api.getMe()).username;
+  if (!username) throw new Error("У бота не задан username в BotFather");
+  botUsernameCache = username;
+  return username;
+}
+
+async function notifyParticipants(deal: DealRow, text: string) {
+  const ids = [deal.buyer_tg_id, deal.seller_tg_id]
+    .filter((id, index, all): id is number => id !== null && all.indexOf(id) === index);
+  for (const id of ids) await bot.api.sendMessage(id, text).catch(() => undefined);
+}
+
+export async function tryAdvanceDeal(dealId: number) {
+  const deal = getDeal(dealId);
+  if (!deal || !["draft", "awaiting_wallets"].includes(deal.status)) return;
+  if (!deal.buyer_tg_id || !deal.seller_tg_id) return;
+
+  const buyerUser = getUser(deal.buyer_tg_id);
+  const sellerUser = getUser(deal.seller_tg_id);
+  if (!buyerUser?.wallet_address || !sellerUser?.wallet_address) {
+    setDealStatus(dealId, "awaiting_wallets");
+    return;
+  }
+
+  const buyer = parseAddress(buyerUser.wallet_address);
+  const seller = parseAddress(sellerUser.wallet_address);
+  if (!buyer || !seller) {
+    setDealStatus(dealId, "awaiting_wallets");
+    return;
+  }
+  if (buyer.equals(seller)) {
+    setDealStatus(dealId, "awaiting_wallets");
+    await notifyParticipants(deal, `Сделка #${dealId}: адреса покупателя и продавца совпадают. Одна из сторон должна изменить адрес через /wallet.`);
+    return;
+  }
+  if (!claimDealSetup(dealId)) return;
+
+  try {
+    setDealAddresses(dealId, formatAddress(buyer), formatAddress(seller));
+    const deployParams = { dealId, buyer, seller, amountUnits: BigInt(deal.amount_units), feePayer: deal.fee_payer };
+    const predictedAddress = await computeEscrowAddress(deployParams);
+    setDealContractAddress(dealId, formatAddress(predictedAddress));
+    // Every active escrow may still need one arbiter transaction to confirm,
+    // cancel or resolve it. Refuse a new deployment unless the service wallet
+    // can keep that action reserve after paying the deployment value.
+    const actionReserveCount = Math.max(1, getDealsForWatcher().length);
+    const contractAddress = await deployEscrow(deployParams, actionReserveCount);
+    if (!contractAddress.equals(predictedAddress)) throw new Error("Computed and deployed escrow addresses do not match");
+    setDealContractAddress(dealId, formatAddress(contractAddress));
+    setDealStatus(dealId, "deployed");
+    const formattedContract = formatAddress(contractAddress);
+    const text =
+      `✅ Escrow-контракт сделки #${dealId} готов.\n\n` +
+      `Покупатель должен перевести ровно ${formatDealPayment(deal)} на адрес:\n${monospace(formattedContract)}\n\n` +
+      "Переведите одной транзакцией без комментария. Не переводите повторно. Покупателю ниже придёт кнопка быстрой оплаты.\n" +
+      `Сеть: ${config.tonNetwork}.\n\n` +
+      `Проверить контракт в Tonviewer:\n${tonviewerUrl(formattedContract)}`;
+    const participantIds = [deal.buyer_tg_id, deal.seller_tg_id]
+      .filter((id, index, all): id is number => id !== null && all.indexOf(id) === index);
+    for (const id of participantIds) {
+      await bot.api.sendMessage(id, text, { parse_mode: "HTML" }).catch(() => undefined);
+    }
+    const paymentDeal = { ...deal, contract_address: formattedContract };
+    if (deal.buyer_tg_id && tonPaymentUrl(paymentDeal)) {
+      await bot.api.sendMessage(
+        deal.buyer_tg_id,
+        `💳 Оплата сделки #${dealId}\n\nК оплате: ${formatDealPayment(deal)}\n` +
+          "Кнопки подставят адрес escrow и точную сумму в совместимый TON-кошелёк. Перед подтверждением ещё раз сверьте адрес и сумму. Комментарий не добавляйте.",
+        { reply_markup: paymentKeyboard(paymentDeal) }
+      ).catch(() => undefined);
+    }
+  } catch (error) {
+    setDealStatus(dealId, "awaiting_wallets");
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Deal #${dealId} deployment failed: ${message}`);
+    for (const tgId of [...config.arbiterTgIds, deal.creator_tg_id]) {
+      await bot.api.sendMessage(tgId, `Не удалось развернуть сделку #${dealId}: ${message}`).catch(() => undefined);
+    }
+  }
+}
+
+async function saveWallet(ctx: Context, raw: string) {
+  if (!ctx.from) return;
+  const address = parseAddress(raw);
+  if (!address) {
+    await ctx.reply("Некорректный TON-адрес. Скопируйте адрес целиком из кошелька или нажмите «Закрыть ввод».");
+    return;
+  }
+  upsertUser(ctx.from.id, ctx.from.username);
+  const formatted = formatAddress(address);
+  setWalletAddress(ctx.from.id, formatted);
+  wizards.delete(ctx.from.id);
+  await ctx.reply(`✅ Адрес сохранён:\n${monospace(formatted)}`, {
+    parse_mode: "HTML",
+    reply_markup: mainMenu(isArbiter(ctx.from.id)),
+  });
+  for (const deal of getPendingDealsForUser(ctx.from.id)) await tryAdvanceDeal(deal.deal_id);
+}
+
+function parseDealId(raw: string | undefined): number | null {
+  const id = Number(raw?.trim());
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+async function readChainState(deal: DealRow): Promise<number | null> {
+  if (!deal.contract_address) return null;
+  try {
+    return Number((await getDealOnChainState(parseAddress(deal.contract_address)!)).state);
+  } catch {
+    return null;
+  }
+}
+
+function dealKeyboard(deal: DealRow, viewerId: number, chainState: number | null): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  if (chainState === 0 && deal.buyer_tg_id === viewerId && tonPaymentUrl(deal)) {
+    addPaymentButtons(keyboard, deal);
+  }
+  if (chainState === 1 && deal.buyer_tg_id === viewerId) keyboard.text("Подтвердить получение", `confirm_receipt:${deal.deal_id}`).icon(emoji.success).success().row();
+  if (chainState === 1 && isDealParticipant(deal, viewerId) && deal.status !== "disputed") keyboard.text("Открыть спор", `open_dispute:${deal.deal_id}`).icon(emoji.warning).row();
+  if (["draft", "awaiting_wallets"].includes(deal.status) || (deal.status === "deployed" && chainState !== 1)) {
+    keyboard.text("Отменить сделку", `cancel_request:${deal.deal_id}`).icon(emoji.cancel).danger().row();
+  }
+  if (isArbiter(viewerId) && deal.contract_address && ["deployed", "funded", "disputed"].includes(deal.status)) {
+    keyboard.text("Админ-действия", `admin_actions:${deal.deal_id}`).icon(emoji.safety).row();
+  }
+  if (deal.contract_address) {
+    keyboard
+      .url("🔎 Tonviewer", tonviewerUrl(deal.contract_address))
+      .url("🔎 Tonscan", tonscanUrl(deal.contract_address))
+      .row();
+  }
+  keyboard
+    .text("Обновить", `view_deal:${deal.deal_id}`)
+    .text(isArbiter(viewerId) ? "К панели" : "К списку", isArbiter(viewerId) ? "admin_panel" : "list_deals");
+  return keyboard;
+}
+
+async function showDeal(ctx: Context, dealId: number, edit: boolean) {
+  if (!ctx.from) return;
+  let deal = getDeal(dealId);
+  if (!deal || (!isDealParticipant(deal, ctx.from.id) && !isArbiter(ctx.from.id))) {
+    if (edit) await ctx.answerCallbackQuery({ text: "Сделка не найдена или нет доступа", show_alert: true });
+    else await ctx.reply("Сделка не найдена или у вас нет к ней доступа.");
+    return;
+  }
+  const chainState = await readChainState(deal);
+  if (chainState === 1 && ["deployed", "setup_pending"].includes(deal.status)) {
+    setDealStatus(dealId, "funded");
+    deal = getDeal(dealId)!;
+  }
+  const chainLabels = ["Created", "Funded", "Completed", "Cancelled", "Resolved"];
+  const chainText = deal.contract_address
+    ? chainState === null ? "\nСтатус контракта временно недоступен" : `\nСтатус контракта: ${chainLabels[chainState] ?? chainState}`
+    : "";
+  const options = {
+    reply_markup: dealKeyboard(deal, ctx.from.id, chainState),
+    link_preview_options: { is_disabled: false },
+    parse_mode: "HTML" as const,
+  };
+  if (edit) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await ctx.editMessageText(dealSummary(deal) + chainText, options).catch(() => undefined);
+  } else {
+    await ctx.reply(dealSummary(deal) + chainText, options);
+  }
+}
+
+async function showDealList(ctx: Context, edit = false) {
+  if (!ctx.from) return;
+  const deals = getDealsForUser(ctx.from.id);
+  if (!deals.length) {
+    if (edit) await ctx.editMessageText("У вас пока нет сделок.").catch(() => undefined);
+    else await ctx.reply("У вас пока нет сделок.", { reply_markup: mainMenu() });
+    return;
+  }
+  const keyboard = new InlineKeyboard();
+  for (const deal of deals) keyboard.text(`#${deal.deal_id} · ${formatDealAmount(deal)} · ${statusLabel(deal.status)}`, `view_deal:${deal.deal_id}`).row();
+  if (edit) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await ctx.editMessageText("Ваши последние сделки:", { reply_markup: keyboard }).catch(() => undefined);
+  } else await ctx.reply("Ваши последние сделки:", { reply_markup: keyboard });
+}
+
+async function showTransparency(ctx: Context) {
+  const arbiter = await getArbiterWallet();
+  const serviceAddress = formatAddress(arbiter.address);
+  const codeHash = await getEscrowCodeHash();
+  let balanceText = "временно недоступен";
+  try {
+    balanceText = `${formatTonAmount((await getServiceWalletInfo()).balance)} TON`;
+  } catch {}
+  const keyboard = new InlineKeyboard()
+    .url("🔎 Service wallet в Tonviewer", tonviewerUrl(serviceAddress)).row()
+    .url("Tonviewer", tonviewerUrl(serviceAddress))
+    .url("Tonscan", tonscanUrl(serviceAddress));
+  await ctx.reply(
+    "🔎 Проверка прозрачности\n\n" +
+    `Сеть: ${config.tonNetwork}\n` +
+    `Комиссия: ${config.feeBps / 100}%\n` +
+    `Служебный Wallet V4: ${serviceAddress}\n` +
+    `Баланс газа: ${balanceText}\n` +
+    `Адрес комиссии: ${config.platformAddress}\n` +
+    `Отпечаток кода escrow:\n${codeHash}\n\n` +
+    "Каждая сделка получает отдельный контракт. Покупатель, продавец и адрес комиссии фиксируются при его создании. " +
+    "Арбитр может подтвердить выплату, вернуть депозит покупателю или разделить сумму при споре, но не может указать произвольный адрес получателя.\n\n" +
+    "Контракт пока не проходил независимый аудит — это mainnet MVP с ограниченными лимитами.\n\n" +
+    `Проверить служебный кошелёк:\n${tonviewerUrl(serviceAddress)}`,
+    { reply_markup: keyboard, link_preview_options: { is_disabled: false } }
+  );
+}
+
+type AdminListMode = "disputes" | "funded" | "pending" | "recent";
+
+function adminGuard(ctx: Context): boolean {
+  return !!ctx.from && isArbiter(ctx.from.id);
+}
+
+async function showAdminPanel(ctx: Context, edit = false) {
+  if (!adminGuard(ctx)) {
+    if (edit) await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }).catch(() => undefined);
+    else await ctx.reply("Команда доступна только администратору.");
+    return;
+  }
+  const stats = getAdminStats();
+  const text =
+    "🛡 Админ-панель\n\n" +
+    `Пользователей: ${stats.users}\n` +
+    `Всего сделок: ${stats.total}\n` +
+    `Активных: ${stats.active}\n` +
+    `Оплачено, ждут решения: ${stats.funded}\n` +
+    `Споров: ${stats.disputed}\n` +
+    `Операций в блокчейне: ${stats.pendingOperations}\n` +
+    `Завершено: ${stats.completed}\n` +
+    `Отменено: ${stats.cancelled}\n` +
+    `Разрешено арбитром: ${stats.resolved}\n` +
+    `Сумма в оплаченных/pending: ${formatTonAmount(stats.lockedUnits)} TON`;
+  const keyboard = new InlineKeyboard()
+    .text("⚠️ Споры", "admin_list:disputes")
+    .text("💰 Оплаченные", "admin_list:funded").row()
+    .text("⏳ Операции", "admin_list:pending")
+    .text("📋 Последние", "admin_list:recent").row()
+    .text("👛 Служебный кошелёк", "admin_wallet").row()
+    .text("🔄 Обновить", "admin_panel");
+  if (edit) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await ctx.editMessageText(text, { reply_markup: keyboard }).catch(() => undefined);
+  } else {
+    await ctx.reply(text, { reply_markup: keyboard });
+  }
+}
+
+async function showAdminDeals(ctx: Context, mode: AdminListMode) {
+  if (!adminGuard(ctx)) return void (await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }));
+  const modes: Record<Exclude<AdminListMode, "recent">, { title: string; statuses: DealStatus[] }> = {
+    disputes: { title: "Споры", statuses: ["disputed"] },
+    funded: { title: "Оплаченные сделки", statuses: ["funded"] },
+    pending: { title: "Операции в блокчейне", statuses: ["setup_pending", "confirm_pending", "cancel_pending", "resolve_pending"] },
+  };
+  const title = mode === "recent" ? "Последние сделки" : modes[mode].title;
+  const deals = mode === "recent" ? getRecentDeals(15) : getDealsByStatuses(modes[mode].statuses, 15);
+  const keyboard = new InlineKeyboard();
+  for (const deal of deals) {
+    keyboard.text(`#${deal.deal_id} · ${formatDealAmount(deal)} · ${statusLabel(deal.status)}`, `view_deal:${deal.deal_id}`).row();
+  }
+  keyboard.text("← Админ-панель", "admin_panel");
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  await ctx.editMessageText(deals.length ? `🛡 ${title}:` : `🛡 ${title}: список пуст`, { reply_markup: keyboard }).catch(() => undefined);
+}
+
+async function showAdminWallet(ctx: Context) {
+  if (!adminGuard(ctx)) return void (await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }));
+  await ctx.answerCallbackQuery({ text: "Проверяю TON RPC" }).catch(() => undefined);
+  try {
+    const service = await getServiceWalletInfo();
+    const address = formatAddress(service.address);
+    const keyboard = new InlineKeyboard()
+      .url("Tonviewer", tonviewerUrl(address))
+      .url("Tonscan", tonscanUrl(address)).row()
+      .text("← Админ-панель", "admin_panel");
+    await ctx.editMessageText(
+      `👛 Служебный Wallet V4\n\nАдрес: ${address}\nБаланс: ${formatTonAmount(service.balance)} TON\nСостояние: ${service.state}\nСеть: ${config.tonNetwork}\n\n${tonviewerUrl(address)}`,
+      { reply_markup: keyboard, link_preview_options: { is_disabled: false } }
+    ).catch(() => undefined);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.editMessageText(`TON RPC временно недоступен: ${message}`, {
+      reply_markup: new InlineKeyboard().text("← Админ-панель", "admin_panel"),
+    }).catch(() => undefined);
+  }
+}
+
+async function beginNewDeal(ctx: Context) {
+  if (!ctx.from) return;
+  upsertUser(ctx.from.id, ctx.from.username);
+  const now = Date.now();
+  if ((newDealCooldowns.get(ctx.from.id) ?? 0) > now) return void (await ctx.reply("Подождите несколько секунд перед повторным созданием сделки."));
+  if (countActiveDealsForUser(ctx.from.id) >= config.maxActiveDealsPerUser) {
+    return void (await ctx.reply(`Достигнут лимит активных сделок: ${config.maxActiveDealsPerUser}. Завершите или отмените старые сделки.`));
+  }
+  newDealCooldowns.set(ctx.from.id, now + 5000);
+  wizards.set(ctx.from.id, { step: "role" });
+  await ctx.reply("Кто вы в этой сделке?", {
+    reply_markup: new InlineKeyboard()
+      .text("Я покупатель", "role_buyer").icon(emoji.buyer)
+      .text("Я продавец", "role_seller").icon(emoji.seller),
+  });
+}
+
+async function cancelParticipantDeal(ctx: Context, dealId: number) {
+  if (!ctx.from) return;
+  let deal = getDeal(dealId);
+  if (!deal || !isDealParticipant(deal, ctx.from.id)) return void (await ctx.reply("Сделка не найдена или у вас нет доступа."));
+  if (["draft", "awaiting_wallets"].includes(deal.status) && !deal.contract_address) {
+    if (!cancelDraftDeal(dealId, ctx.from.id)) return void (await ctx.reply("Статус сделки уже изменился. Обновите карточку."));
+    deal = getDeal(dealId)!;
+    await notifyParticipants(deal, `Сделка #${dealId} отменена до оплаты.`);
+    return;
+  }
+  if (deal.status === "setup_pending") return void (await ctx.reply("Контракт сейчас разворачивается. Подождите около минуты и повторите отмену."));
+  if (deal.status !== "deployed" || !deal.contract_address) {
+    return void (await ctx.reply("Односторонняя отмена сейчас недоступна. После оплаты используйте спор; завершённую сделку отменить нельзя."));
+  }
+  const state = await readChainState(deal);
+  if (state === null) return void (await ctx.reply("Не удалось проверить контракт. Деньги не тронуты; повторите позже."));
+  if (state === 1) {
+    setDealStatus(dealId, "funded");
+    return void (await ctx.reply("Оплата уже поступила. Односторонняя отмена заблокирована — при проблеме откройте спор."));
+  }
+  if (state !== 0) return void (await ctx.reply("Контракт уже завершён или отменён. Обновите карточку сделки."));
+  try {
+    await sendCancel(parseAddress(deal.contract_address)!, dealId);
+    setDealStatus(dealId, "cancel_pending");
+    await notifyParticipants(deal, `Отмена сделки #${dealId} отправлена в блокчейн. Если платёж находился в пути и успел попасть в контракт, контракт вернёт его покупателю.`);
+  } catch (error) {
+    await ctx.reply(`Не удалось отправить отмену: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+bot.command("start", async (ctx) => {
+  if (!ctx.from) return;
+  upsertUser(ctx.from.id, ctx.from.username);
+  const payload = ctx.match?.toString().trim();
+  if (payload?.startsWith("join_")) {
+    const deal = getDealByInviteToken(payload.slice("join_".length));
+    if (!deal) return void (await ctx.reply("Ссылка недействительна или сделка не найдена.", { reply_markup: mainMenu(isArbiter(ctx.from.id)) }));
+    if (deal.creator_tg_id === ctx.from.id) return void (await ctx.reply("Это ваша сделка. Перешлите ссылку второй стороне."));
+    try {
+      const joined = joinDeal(deal.deal_id, ctx.from.id, ctx.from.username);
+      const role = joined.buyer_tg_id === ctx.from.id ? "покупатель" : "продавец";
+      await ctx.reply(`✅ Вы присоединились к сделке #${joined.deal_id} как ${role}.\n` +
+        (getUser(ctx.from.id)?.wallet_address ? "Ваш TON-адрес уже сохранён." : "Теперь нажмите «Кошелёк» и укажите адрес для этой роли."), { reply_markup: mainMenu(isArbiter(ctx.from.id)) });
+      if (config.miniAppUrl) {
+        await ctx.reply("Откройте карточку сделки — там показан ваш следующий шаг.", {
+          reply_markup: new InlineKeyboard().webApp("Открыть сделку #" + joined.deal_id, `${config.miniAppUrl}/?deal=${joined.deal_id}`),
+        });
+      }
+      await tryAdvanceDeal(joined.deal_id);
+    } catch (error) {
+      await ctx.reply(error instanceof Error ? error.message : "Не удалось присоединиться к сделке");
+    }
+    return;
+  }
+  await ctx.reply("TON Escrow — безопасная сделка через отдельный смарт-контракт.\n\nСоздайте сделку, перешлите приглашение второй стороне и следуйте подсказкам. Не подтверждайте получение до фактической передачи товара или услуги.", { reply_markup: mainMenu(isArbiter(ctx.from.id)) });
+});
+
+bot.command("help", async (ctx) => {
+  await ctx.reply("Как пользоваться:\n1. Сохраните свой TON-адрес через кнопку «Кошелёк».\n2. Создайте сделку и отправьте приглашение второй стороне.\n3. Покупатель переводит ровно указанную сумму на escrow-адрес.\n4. После получения товара покупатель подтверждает сделку.\n\nДо оплаты сделку можно отменить. После оплаты при проблеме нужно открыть спор. Никому не сообщайте seed-фразу.\n\n/transparency — проверить архитектуру, комиссию и on-chain адреса.", { reply_markup: mainMenu(!!ctx.from && isArbiter(ctx.from.id)) });
+});
+
+bot.command("wallet", async (ctx) => {
+  if (!ctx.from) return;
+  const raw = ctx.match?.toString().trim();
+  if (raw) return void (await saveWallet(ctx, raw));
+  wizards.set(ctx.from.id, { step: "wallet" });
+  const current = getUser(ctx.from.id)?.wallet_address;
+  await ctx.reply(`${current ? `Текущий адрес:\n${current}\n\n` : ""}Отправьте новый TON-адрес одним сообщением.`, { reply_markup: new Keyboard().text(BTN_STOP).resized().oneTime() });
+});
+
+bot.command("newdeal", beginNewDeal);
+bot.command("mydeals", (ctx) => showDealList(ctx));
+bot.command("transparency", showTransparency);
+bot.command("admin", (ctx) => showAdminPanel(ctx));
+bot.command("status", async (ctx) => {
+  const dealId = parseDealId(ctx.match?.toString());
+  if (!dealId) return void (await ctx.reply("Использование: /status <id сделки>"));
+  await showDeal(ctx, dealId, false);
+});
+bot.command("stop", async (ctx) => {
+  if (ctx.from) wizards.delete(ctx.from.id);
+  await ctx.reply("Ввод отменён.", { reply_markup: mainMenu() });
+});
+bot.command("canceldeal", async (ctx) => {
+  const dealId = parseDealId(ctx.match?.toString());
+  if (!dealId) return void (await ctx.reply("Использование: /canceldeal <id сделки>"));
+  const deal = getDeal(dealId);
+  if (!ctx.from || !deal || !isDealParticipant(deal, ctx.from.id)) return void (await ctx.reply("Сделка не найдена или у вас нет доступа."));
+  await ctx.reply(`Отменить сделку #${dealId}? До оплаты отмена окончательная.`, { reply_markup: new InlineKeyboard().text("Да, отменить", `cancel_yes:${dealId}`).text("Нет", `view_deal:${dealId}`) });
+});
+
+bot.callbackQuery(["role_buyer", "role_seller"], async (ctx) => {
+  const role = ctx.callbackQuery.data === "role_buyer" ? "buyer" : "seller";
+  wizards.set(ctx.from.id, { step: "counterparty", role });
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("Укажите @username второй стороны. Если username неизвестен, отправьте один дефис: -\nСсылку-приглашение всё равно нужно будет переслать вручную.");
+});
+
+bot.callbackQuery(["fee_buyer", "fee_seller"], async (ctx) => {
+  const state = wizards.get(ctx.from.id);
+  if (!state || state.step !== "fee_payer") {
+    return void (await ctx.answerCallbackQuery({ text: "Создание сделки уже завершено или отменено", show_alert: true }));
+  }
+  state.feePayer = ctx.callbackQuery.data === "fee_buyer" ? "buyer" : "seller";
+  state.step = "description";
+  wizards.set(ctx.from.id, state);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    state.feePayer === "buyer"
+      ? `Комиссия ${config.feeBps / 100}% будет добавлена к платежу покупателя. Продавец получит всю сумму сделки.\n\nТеперь опишите товар или услугу и условия передачи:`
+      : `Комиссия ${config.feeBps / 100}% будет удержана из выплаты продавцу. Покупатель оплатит только сумму сделки.\n\nТеперь опишите товар или услугу и условия передачи:`
+  );
+});
+
+bot.callbackQuery(/^view_deal:(\d+)$/, (ctx) => showDeal(ctx, Number(ctx.match[1]), true));
+bot.callbackQuery("list_deals", (ctx) => showDealList(ctx, true));
+bot.callbackQuery("admin_panel", (ctx) => showAdminPanel(ctx, true));
+bot.callbackQuery(/^admin_list:(disputes|funded|pending|recent)$/, (ctx) => showAdminDeals(ctx, ctx.match[1] as AdminListMode));
+bot.callbackQuery("admin_wallet", showAdminWallet);
+bot.callbackQuery(/^admin_actions:(\d+)$/, async (ctx) => {
+  if (!isArbiter(ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }));
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal?.contract_address || !["deployed", "funded", "disputed"].includes(deal.status)) {
+    return void (await ctx.answerCallbackQuery({ text: "Статус сделки изменился", show_alert: true }));
+  }
+  const keyboard = new InlineKeyboard().text("↩️ Возврат покупателю", `admin_cancel_prepare:${dealId}`).row();
+  if (["funded", "disputed"].includes(deal.status)) {
+    keyboard
+      .text("0% продавцу", `admin_resolve_prepare:${dealId}:0`)
+      .text("50/50", `admin_resolve_prepare:${dealId}:50`)
+      .text("100% продавцу", `admin_resolve_prepare:${dealId}:100`).row();
+  }
+  keyboard.text("← К сделке", `view_deal:${dealId}`);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    `🛡 Действия по сделке #${dealId}\n\nТекущий статус: ${statusLabel(deal.status)}\n` +
+    "Каждое действие потребует ещё одного подтверждения. Для другого распределения используйте /resolve <id> <% продавцу>.",
+    { reply_markup: keyboard }
+  );
+});
+bot.callbackQuery(/^admin_cancel_prepare:(\d+)$/, async (ctx) => {
+  if (!isArbiter(ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }));
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal?.contract_address || !["deployed", "funded", "disputed"].includes(deal.status)) {
+    return void (await ctx.answerCallbackQuery({ text: "Статус сделки изменился", show_alert: true }));
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(`Подтвердить возврат по сделке #${dealId} покупателю?`, {
+    reply_markup: new InlineKeyboard().text("Да, отправить Cancel", `admin_cancel_yes:${dealId}`).text("Нет", `view_deal:${dealId}`),
+  });
+});
+bot.callbackQuery(/^admin_resolve_prepare:(\d+):(0|50|100)$/, async (ctx) => {
+  if (!isArbiter(ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Только для администратора", show_alert: true }));
+  const dealId = Number(ctx.match[1]);
+  const sellerPercent = Number(ctx.match[2]);
+  const deal = getDeal(dealId);
+  if (!deal?.contract_address || !["funded", "disputed"].includes(deal.status)) {
+    return void (await ctx.answerCallbackQuery({ text: "Статус сделки изменился", show_alert: true }));
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    `Подтвердить решение по сделке #${dealId}: продавцу ${sellerPercent}%, покупателю ${100 - sellerPercent}% остатка после комиссии?`,
+    { reply_markup: new InlineKeyboard().text("Да, отправить Resolve", `admin_resolve_yes:${dealId}:${sellerPercent}`).text("Нет", `view_deal:${dealId}`) }
+  );
+});
+bot.callbackQuery(/^cancel_request:(\d+)$/, async (ctx) => {
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal || !isDealParticipant(deal, ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Нет доступа", show_alert: true }));
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(`Отменить сделку #${dealId}? До оплаты это действие окончательное.`, { reply_markup: new InlineKeyboard().text("Да, отменить", `cancel_yes:${dealId}`).text("Нет", `view_deal:${dealId}`) });
+});
+bot.callbackQuery(/^cancel_yes:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "Проверяю состояние сделки" });
+  await cancelParticipantDeal(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^confirm_receipt:(\d+)$/, async (ctx) => {
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal || deal.buyer_tg_id !== ctx.from.id) return void (await ctx.answerCallbackQuery({ text: "Подтвердить получение может только покупатель", show_alert: true }));
+  if (deal.status !== "funded") return void (await ctx.answerCallbackQuery({ text: "Сделка уже обрабатывается или имеет другой статус", show_alert: true }));
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    `Вы точно получили товар или услугу по сделке #${dealId}? После подтверждения выплата продавцу необратима.`,
+    { reply_markup: new InlineKeyboard().text("Да, всё получено", `confirm_yes:${dealId}`).row().text("Нет, вернуться", `view_deal:${dealId}`) }
+  );
+});
+
+bot.callbackQuery(/^confirm_yes:(\d+)$/, async (ctx) => {
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal || deal.buyer_tg_id !== ctx.from.id) return void (await ctx.answerCallbackQuery({ text: "Подтвердить получение может только покупатель", show_alert: true }));
+  if (deal.status !== "funded") return void (await ctx.answerCallbackQuery({ text: "Статус сделки уже изменился", show_alert: true }));
+  await ctx.answerCallbackQuery({ text: "Отправляю выплату продавцу" });
+  try {
+    await sendConfirm(parseAddress(deal.contract_address!)!, dealId);
+    setDealStatus(dealId, "confirm_pending");
+    await ctx.editMessageText(`Получение по сделке #${dealId} подтверждено. Выплата отправлена в блокчейн.`);
+  } catch (error) {
+    await ctx.reply(`Не удалось отправить выплату: ${error instanceof Error ? error.message : String(error)}`);
+  }
+});
+
+bot.callbackQuery(/^open_dispute:(\d+)$/, async (ctx) => {
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal || !isDealParticipant(deal, ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "У вас нет доступа к сделке", show_alert: true }));
+  if (deal.status !== "funded") return void (await ctx.answerCallbackQuery({ text: "Спор нельзя открыть в текущем статусе", show_alert: true }));
+  setDealStatus(dealId, "disputed");
+  await ctx.answerCallbackQuery({ text: "Спор открыт" });
+  await ctx.editMessageText(`По сделке #${dealId} открыт спор. Арбитр уведомлён.`);
+  for (const adminId of config.arbiterTgIds) await bot.api.sendMessage(adminId, `⚠️ Спор по сделке #${dealId}. Используйте /resolve ${dealId} <% продавцу> или /cancel ${dealId}.`).catch(() => undefined);
+});
+
+bot.command("cancel", async (ctx) => adminAction(ctx, "cancel"));
+bot.command("resolve", async (ctx) => adminAction(ctx, "resolve"));
+
+async function adminAction(ctx: Context, action: "cancel" | "resolve") {
+  if (!ctx.from) return;
+  if (!isArbiter(ctx.from.id)) return void (await ctx.reply("Команда доступна только арбитру."));
+  const parts = ctx.match?.toString().trim().split(/\s+/).filter(Boolean) ?? [];
+  const dealId = Number(parts[0]);
+  const deal = Number.isSafeInteger(dealId) ? getDeal(dealId) : undefined;
+  if (!deal?.contract_address) return void (await ctx.reply("Сделка или контракт не найдены."));
+  if (action === "cancel") {
+    if (!["deployed", "funded", "disputed"].includes(deal.status)) return void (await ctx.reply("Сделку нельзя отменить в текущем статусе."));
+    await ctx.reply(`Подтвердить возврат по сделке #${dealId} покупателю?`, {
+      reply_markup: new InlineKeyboard().text("Да, отправить Cancel", `admin_cancel_yes:${dealId}`).text("Нет", `view_deal:${dealId}`),
+    });
+  } else {
+    const sellerPercent = Number(parts[1]);
+    if (!Number.isInteger(sellerPercent) || sellerPercent < 0 || sellerPercent > 100) return void (await ctx.reply("Использование: /resolve <id> <целый процент продавцу 0-100>"));
+    if (!["funded", "disputed"].includes(deal.status)) return void (await ctx.reply("Разрешить спор нельзя в текущем статусе."));
+    await ctx.reply(`Подтвердить решение по сделке #${dealId}: продавцу ${sellerPercent}%, покупателю ${100 - sellerPercent}% остатка после комиссии?`, {
+      reply_markup: new InlineKeyboard().text("Да, отправить Resolve", `admin_resolve_yes:${dealId}:${sellerPercent}`).text("Нет", `view_deal:${dealId}`),
+    });
+  }
+}
+
+bot.callbackQuery(/^admin_cancel_yes:(\d+)$/, async (ctx) => {
+  if (!isArbiter(ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Только для арбитра", show_alert: true }));
+  const dealId = Number(ctx.match[1]);
+  const deal = getDeal(dealId);
+  if (!deal?.contract_address || !["deployed", "funded", "disputed"].includes(deal.status)) return void (await ctx.answerCallbackQuery({ text: "Статус сделки изменился", show_alert: true }));
+  await ctx.answerCallbackQuery({ text: "Отправляю Cancel" });
+  try {
+    await sendCancel(parseAddress(deal.contract_address)!, dealId);
+    setDealStatus(dealId, "cancel_pending");
+    await ctx.editMessageText(`Возврат по сделке #${dealId} отправлен в блокчейн.`);
+  } catch (error) {
+    await ctx.reply(`Ошибка блокчейна: ${error instanceof Error ? error.message : String(error)}`);
+  }
+});
+
+bot.callbackQuery(/^admin_resolve_yes:(\d+):(\d+)$/, async (ctx) => {
+  if (!isArbiter(ctx.from.id)) return void (await ctx.answerCallbackQuery({ text: "Только для арбитра", show_alert: true }));
+  const dealId = Number(ctx.match[1]);
+  const sellerPercent = Number(ctx.match[2]);
+  const deal = getDeal(dealId);
+  if (!deal?.contract_address || !["funded", "disputed"].includes(deal.status)) return void (await ctx.answerCallbackQuery({ text: "Статус сделки изменился", show_alert: true }));
+  await ctx.answerCallbackQuery({ text: "Отправляю Resolve" });
+  try {
+    await sendResolve(parseAddress(deal.contract_address)!, dealId, sellerPercent * 100);
+    setDealStatus(dealId, "resolve_pending");
+    await ctx.editMessageText(`Решение по сделке #${dealId} отправлено: продавцу ${sellerPercent}%, покупателю ${100 - sellerPercent}% после комиссии.`);
+  } catch (error) {
+    await ctx.reply(`Ошибка блокчейна: ${error instanceof Error ? error.message : String(error)}`);
+  }
+});
+
+bot.hears(BTN_NEW, beginNewDeal);
+bot.hears(BTN_DEALS, (ctx) => showDealList(ctx));
+bot.hears(BTN_WALLET, async (ctx) => {
+  if (!ctx.from) return;
+  wizards.set(ctx.from.id, { step: "wallet" });
+  const current = getUser(ctx.from.id)?.wallet_address;
+  await ctx.reply(`${current ? `Текущий адрес:\n${current}\n\n` : ""}Отправьте новый TON-адрес одним сообщением.`, { reply_markup: new Keyboard().text(BTN_STOP).resized().oneTime() });
+});
+bot.hears(BTN_HELP, async (ctx) => {
+  if (!ctx.from) return;
+  await ctx.reply("Откройте /help — там краткая инструкция и правила отмены.", { reply_markup: mainMenu(isArbiter(ctx.from.id)) });
+});
+bot.hears(BTN_VERIFY, showTransparency);
+bot.hears(BTN_ADMIN, (ctx) => showAdminPanel(ctx));
+bot.hears(BTN_STOP, async (ctx) => {
+  if (!ctx.from) return;
+  wizards.delete(ctx.from.id);
+  await ctx.reply("Ввод отменён.", { reply_markup: mainMenu() });
+});
+
+bot.on("message:text", async (ctx, next) => {
+  const state = wizards.get(ctx.from.id);
+  if (!state) return next();
+  const text = ctx.message.text.trim();
+  if (state.step === "wallet") return void (await saveWallet(ctx, text));
+  if (state.step === "counterparty") {
+    const username = text === "-" ? null : text.replace(/^@/, "").trim();
+    if (username !== null && !/^[A-Za-z0-9_]{5,32}$/.test(username)) return void (await ctx.reply("Введите корректный @username или один дефис: -"));
+    if (username && username.toLowerCase() === ctx.from.username?.toLowerCase()) return void (await ctx.reply("Нельзя указать самого себя второй стороной."));
+    state.counterpartyUsername = username;
+    state.step = "amount";
+    wizards.set(ctx.from.id, state);
+    await ctx.reply(`Введите сумму в TON от ${config.minDealTon} до ${config.maxDealTon}, например 2.5:`);
+    return;
+  }
+  if (state.step === "amount") {
+    try {
+      const amount = parseTonAmount(text);
+      if (amount < dealLimits.minUnits || amount > dealLimits.maxUnits) return void (await ctx.reply(`Допустимая сумма: от ${config.minDealTon} до ${config.maxDealTon} TON.`));
+      state.amountUnits = amount;
+      state.step = "fee_payer";
+      wizards.set(ctx.from.id, state);
+      await ctx.reply("Кто оплачивает комиссию сервиса?", {
+        reply_markup: new InlineKeyboard()
+          .text(`Покупатель +${config.feeBps / 100}%`, "fee_buyer")
+          .text(`Продавец −${config.feeBps / 100}%`, "fee_seller"),
+      });
+    } catch (error) {
+      await ctx.reply(error instanceof Error ? error.message : "Некорректная сумма");
+    }
+    return;
+  }
+  if (state.step === "description") {
+    if (text.length < 3 || text.length > 1000) return void (await ctx.reply("Описание должно содержать от 3 до 1000 символов."));
+    if (countActiveDealsForUser(ctx.from.id) >= config.maxActiveDealsPerUser) {
+      wizards.delete(ctx.from.id);
+      return void (await ctx.reply("Лимит активных сделок уже достигнут. Ввод закрыт.", { reply_markup: mainMenu() }));
+    }
+    const deal = createDeal({ creatorTgId: ctx.from.id, creatorRole: state.role!, counterpartyUsername: state.counterpartyUsername ?? null, amountUnits: state.amountUnits!, feePayer: state.feePayer!, description: text });
+    wizards.delete(ctx.from.id);
+    let username: string;
+    try {
+      username = await botUsername();
+    } catch {
+      await ctx.reply(`Сделка #${deal.deal_id} создана, но Telegram временно недоступен для генерации ссылки. Откройте /mydeals и повторите через минуту.`, { reply_markup: mainMenu() });
+      return;
+    }
+    const link = `https://t.me/${username}?startapp=join_${deal.invite_token}`;
+    await ctx.reply(`✅ Сделка #${deal.deal_id} создана.\nСумма: ${formatDealAmount(deal)}\nПредмет: ${deal.description}\n\nПерешлите второй стороне одноразовую ссылку:\n${link}\n\nОбе стороны должны сохранить свои TON-адреса через кнопку «Кошелёк».`, { reply_markup: mainMenu() });
+    return;
+  }
+  return next();
+});
+
+bot.catch((error) => {
+  const message = error.error instanceof Error ? error.error.message : "Unknown Telegram error";
+  console.error(`Bot error while handling update ${error.ctx.update.update_id}: ${message}`);
+});
