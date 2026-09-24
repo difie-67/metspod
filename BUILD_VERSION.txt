@@ -1,0 +1,10 @@
+OBRA BUILD ID: 2026-09-24_14-52_dealux7_adminlogs
+
+Build logs MUST show:
+OBRA BUILD PHASE: 2026-09-24_14-52_dealux7_adminlogs
+
+Runtime logs MUST show:
+OBRA BUILD: 2026-09-24_14-52_dealux7_adminlogs
+
+Admin panel diagnostics will also show this build id, startup time, runtime log tail,
+service wallet details, escrow code hash, and verifier link (if configured).
