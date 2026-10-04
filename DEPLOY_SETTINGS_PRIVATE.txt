@@ -1,0 +1,5 @@
+Настройки для копирования в Environment хостинга. Не публикуйте этот файл.
+
+COMMUNITY_INTEGRATION_KEY=__yysr0LqqRJ8T7n8K_jhCPVe3FsCldgNaK2OEDyKD1BEJxq
+
+Остальные существующие переменные Railway сохраните.
